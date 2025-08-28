@@ -19,6 +19,9 @@
 #include <sys/un.h>
 #include <signal.h>
 
+#include <memory>
+#include <utility>
+
 struct wl_event_source;
 
 WAYLIB_SERVER_BEGIN_NAMESPACE
@@ -28,87 +31,202 @@ Q_LOGGING_CATEGORY(waylibSocket, "waylib.server.socket", QtInfoMsg)
 
 #define LOCK_SUFFIX ".lock"
 
-// Copy from libwayland
+// RAII wrapper for file descriptors
+class FileDescriptor {
+public:
+    explicit FileDescriptor(int fd = -1) noexcept : m_fd(fd) {}
+    ~FileDescriptor() { reset(); }
+
+    FileDescriptor(const FileDescriptor&) = delete;
+    FileDescriptor& operator=(const FileDescriptor&) = delete;
+
+    FileDescriptor(FileDescriptor&& other) noexcept : m_fd(other.release()) {}
+    FileDescriptor& operator=(FileDescriptor&& other) noexcept {
+        reset(other.release());
+        return *this;
+    }
+
+    int get() const noexcept { return m_fd; }
+    int release() noexcept {
+        int fd = m_fd;
+        m_fd = -1;
+        return fd;
+    }
+
+    void reset(int fd = -1) noexcept {
+        if (m_fd >= 0 && m_fd != fd) {
+            ::close(m_fd);
+        }
+        m_fd = fd;
+    }
+
+    bool isValid() const noexcept { return m_fd >= 0; }
+    operator bool() const noexcept { return isValid(); }
+
+private:
+    int m_fd;
+};
+
+// Helper functions for error handling and logging
+namespace SocketUtils {
+    inline void logSystemError(const QString& operation, const QString& context) {
+        qCWarning(waylibSocket) << operation << "failed for" << context 
+                               << ":" << QString::fromLocal8Bit(strerror(errno));
+    }
+
+    inline void logWarning(const QString& message, const QString& context = QString()) {
+        if (context.isEmpty()) {
+            qCWarning(waylibSocket) << message;
+        } else {
+            qCWarning(waylibSocket) << message << context;
+        }
+    }
+
+    inline void logDebug(const QString& message, const QString& context = QString()) {
+        if (context.isEmpty()) {
+            qCDebug(waylibSocket) << message;
+        } else {
+            qCDebug(waylibSocket) << message << context;
+        }
+    }
+}
+
+// Socket locking utilities
+namespace SocketLocking {
+    
+    // Create and open a lock file for the given socket path
+    FileDescriptor createLockFile(const QString& socketPath) {
+        const QString lockFile = socketPath + LOCK_SUFFIX;
+        const auto lockFilePath = lockFile.toUtf8();
+
+        int fd = open(lockFilePath.constData(), O_CREAT | O_CLOEXEC | O_RDWR,
+                     (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP));
+
+        if (fd < 0) {
+            SocketUtils::logWarning("Failed to open lockfile - please check file permissions", lockFile);
+            return FileDescriptor(-1);
+        }
+
+        return FileDescriptor(fd);
+    }
+
+    // Acquire an exclusive lock on the file descriptor
+    bool acquireFileLock(int fd, const QString& lockFile) {
+        if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+            SocketUtils::logWarning("Failed to lock - another compositor may be running", lockFile);
+            return false;
+        }
+        return true;
+    }
+
+    // Check if socket file exists and clean it up if needed
+    bool validateAndCleanupSocket(const QString& socketPath) {
+        struct stat socket_stat;
+        const QByteArray socketPathBytes = socketPath.toUtf8();
+
+        if (lstat(socketPathBytes.constData(), &socket_stat) < 0) {
+            if (errno != ENOENT) {
+                SocketUtils::logSystemError("Failed to stat file", socketPath);
+                return false;
+            }
+            // File doesn't exist, which is fine
+            return true;
+        } 
+
+        // Check if socket file has write permissions that might indicate stale socket
+        if (socket_stat.st_mode & S_IWUSR || socket_stat.st_mode & S_IWGRP) {
+            SocketUtils::logDebug("Removing existing socket file", socketPath);
+            unlink(socketPathBytes.constData());
+        }
+
+        return true;
+    }
+}
+
+// Copy from libwayland - refactored for better maintainability
 static int wl_socket_lock(const QString &socketFile)
 {
-    int fd_lock = -1;
-    struct stat socket_stat;
-
-    QString lockFile = socketFile + LOCK_SUFFIX;
-    QByteArray addr_sun_path = socketFile.toUtf8();
-    const auto lockFilePath = lockFile.toUtf8();
-
-    fd_lock = open(lockFilePath.constData(), O_CREAT | O_CLOEXEC | O_RDWR,
-                   (S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP));
-
-    if (fd_lock < 0) {
-        qCWarning(waylibSocket) << "Failed to open lockfile" << lockFile << "- please check file permissions";
-        goto err;
+    // Create and open lock file
+    FileDescriptor lockFd = SocketLocking::createLockFile(socketFile);
+    if (!lockFd.isValid()) {
+        return -1;
     }
 
-    if (flock(fd_lock, LOCK_EX | LOCK_NB) < 0) {
-        qCWarning(waylibSocket) << "Failed to lock" << lockFile << "- another compositor may be running";
-        goto err_fd;
+    // Acquire exclusive lock
+    const QString lockFile = socketFile + LOCK_SUFFIX;
+    if (!SocketLocking::acquireFileLock(lockFd.get(), lockFile)) {
+        return -1;
     }
 
-    if (lstat(addr_sun_path, &socket_stat) < 0 ) {
-        if (errno != ENOENT) {
-            qCWarning(waylibSocket) << "Failed to stat file:" << socketFile;
-            goto err_fd;
+    // Validate and cleanup existing socket if needed
+    if (!SocketLocking::validateAndCleanupSocket(socketFile)) {
+        return -1;
+    }
+
+    // Success - release ownership of file descriptor
+    return lockFd.release();
+}
+
+// File descriptor utilities
+namespace FileDescriptorUtils {
+    
+    // Set CLOEXEC flag on file descriptor or close it on failure
+    int setCloexecOrClose(int fd) {
+        if (fd == -1) {
+            return -1;
         }
-    } else if (socket_stat.st_mode & S_IWUSR ||
-               socket_stat.st_mode & S_IWGRP) {
-        qCDebug(waylibSocket) << "Removing existing socket file:" << socketFile;
-        unlink(addr_sun_path);
+
+        const long flags = fcntl(fd, F_GETFD);
+        if (flags == -1) {
+            ::close(fd);
+            return -1;
+        }
+
+        if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1) {
+            ::close(fd);
+            return -1;
+        }
+
+        return fd;
     }
 
-    return fd_lock;
-err_fd:
-    close(fd_lock);
-    fd_lock = -1;
-err:
-    return fd_lock;
+    // Create socket with CLOEXEC flag
+    int createCloexecSocket(int domain, int type, int protocol) {
+        // Try with SOCK_CLOEXEC first (modern systems)
+        int fd = socket(domain, type | SOCK_CLOEXEC, protocol);
+        if (fd >= 0) {
+            return fd;
+        }
+
+        // Fall back to manual CLOEXEC setting if SOCK_CLOEXEC not supported
+        if (errno != EINVAL) {
+            return -1;
+        }
+
+        fd = socket(domain, type, protocol);
+        return setCloexecOrClose(fd);
+    }
+
+    // Accept connection with CLOEXEC flag  
+    int acceptCloexecConnection(int sockfd, sockaddr *addr, socklen_t *addrlen) {
+        const int fd = accept(sockfd, addr, addrlen);
+        return setCloexecOrClose(fd);
+    }
 }
 
 static int set_cloexec_or_close(int fd)
 {
-    long flags;
-
-    if (fd == -1)
-        return -1;
-
-    flags = fcntl(fd, F_GETFD);
-    if (flags == -1)
-        goto err;
-
-    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1)
-        goto err;
-
-    return fd;
-
-err:
-    close(fd);
-    return -1;
+    return FileDescriptorUtils::setCloexecOrClose(fd);
 }
 
 static int wl_os_socket_cloexec(int domain, int type, int protocol)
 {
-    int fd;
-
-    fd = socket(domain, type | SOCK_CLOEXEC, protocol);
-    if (fd >= 0)
-        return fd;
-    if (errno != EINVAL)
-        return -1;
-
-    fd = socket(domain, type, protocol);
-    return set_cloexec_or_close(fd);
+    return FileDescriptorUtils::createCloexecSocket(domain, type, protocol);
 }
 
 static int wl_os_accept_cloexec(int sockfd, sockaddr *addr, socklen_t *addrlen)
 {
-    int fd = accept(sockfd, addr, addrlen);
-    return set_cloexec_or_close(fd);
+    return FileDescriptorUtils::acceptCloexecConnection(sockfd, addr, addrlen);
 }
 // Copy end
 
@@ -178,15 +296,41 @@ WlClientDestroyListener *WlClientDestroyListener::get(const wl_client *client)
     return tmp;
 }
 
+// Client management utilities
+namespace ClientManagement {
+    
+    // Pause or resume a client process using signals
+    bool pauseClient(wl_client *client, bool pause) {
+        if (!client) {
+            return false;
+        }
+
+        pid_t pid = 0;
+        wl_client_get_credentials(client, &pid, nullptr, nullptr);
+
+        if (pid == 0) {
+            SocketUtils::logWarning("Cannot get valid PID for client");
+            return false;
+        }
+
+        const int signal = pause ? SIGSTOP : SIGCONT;
+        const bool success = (kill(pid, signal) == 0);
+        
+        if (!success) {
+            SocketUtils::logSystemError(pause ? "Failed to pause client" : "Failed to resume client", 
+                                       QString("PID: %1").arg(pid));
+        } else {
+            SocketUtils::logDebug(pause ? "Client paused successfully" : "Client resumed successfully",
+                                 QString("PID: %1").arg(pid));
+        }
+
+        return success;
+    }
+}
+
 static bool pauseClient(wl_client *client, bool pause)
 {
-    pid_t pid = 0;
-    wl_client_get_credentials(client, &pid, nullptr, nullptr);
-
-    if (pid == 0)
-        return false;
-
-    return kill(pid, pause ? SIGSTOP : SIGCONT) == 0;
+    return ClientManagement::pauseClient(client, pause);
 }
 
 void WSocketPrivate::shutdown()
@@ -449,124 +593,205 @@ bool WSocket::autoCreate(const QString &directory)
     return false;
 }
 
+// Socket creation utilities
+namespace SocketCreation {
+    
+    // Create and bind a Unix domain socket to the specified path
+    bool createAndBindSocket(int socketFd, const QString& filePath) {
+        const QByteArray pathBytes = filePath.toUtf8();
+        sockaddr_un addr{};
+        addr.sun_family = AF_LOCAL;
+        
+        const size_t pathLength = qMin(size_t(sizeof(addr.sun_path)), 
+                                      size_t(pathBytes.size()) + 1);
+        qstrncpy(addr.sun_path, pathBytes.constData(), pathLength);
+        
+        const socklen_t addrSize = offsetof(sockaddr_un, sun_path) + pathLength;
+        
+        if (::bind(socketFd, reinterpret_cast<const sockaddr*>(&addr), addrSize) < 0) {
+            SocketUtils::logSystemError("Socket bind failed", filePath);
+            return false;
+        }
+        
+        return true;
+    }
+
+    // Set socket to listening mode
+    bool enableSocketListening(int socketFd, const QString& context) {
+        constexpr int BACKLOG_SIZE = 128; // Standard backlog size for Wayland sockets
+        
+        if (::listen(socketFd, BACKLOG_SIZE) < 0) {
+            SocketUtils::logSystemError("Socket listen failed", context);
+            return false;
+        }
+        
+        SocketUtils::logDebug("Socket listening enabled", context);
+        return true;
+    }
+}
+
 bool WSocket::create(const QString &filePath)
 {
     W_D(WSocket);
 
-    if (isValid())
+    if (isValid()) {
+        SocketUtils::logWarning("Socket already valid, cannot create");
         return false;
+    }
 
+    // Create socket with CLOEXEC flag
     d->fd = wl_os_socket_cloexec(PF_LOCAL, SOCK_STREAM, 0);
-    if (d->fd < 0)
+    if (d->fd < 0) {
+        SocketUtils::logSystemError("Failed to create socket", filePath);
         return false;
+    }
 
     d->ownsFd = true;
+    
+    // Acquire socket lock
     d->fd_lock = wl_socket_lock(filePath);
     if (d->fd_lock < 0) {
+        SocketUtils::logWarning("Failed to acquire socket lock", filePath);
         close();
         return false;
     }
 
-    QByteArray path = filePath.toUtf8();
-    sockaddr_un addr;
-    addr.sun_family = AF_LOCAL;
-    const size_t pathLength = qMin(size_t(sizeof(addr.sun_path)), size_t(path.size()) + 1);
-    qstrncpy(addr.sun_path, path.constData(), pathLength);
-    socklen_t size = offsetof(sockaddr_un, sun_path) + pathLength;
-    if (::bind(d->fd, (sockaddr*) &addr, size) < 0) {
+    // Bind socket to path
+    if (!SocketCreation::createAndBindSocket(d->fd, filePath)) {
         close();
-        qCWarning(waylibSocket) << "Socket bind failed:" << QString::fromLocal8Bit(strerror(errno));
         return false;
     }
 
-    if (::listen(d->fd, 128) < 0) {
+    // Enable listening
+    if (!SocketCreation::enableSocketListening(d->fd, filePath)) {
         close();
-        qCWarning(waylibSocket) << "Socket listen failed:" << QString::fromLocal8Bit(strerror(errno));
         return false;
     }
 
+    // Update socket file path if changed
     if (d->socket_file != filePath) {
         d->socket_file = filePath;
         Q_EMIT fullServerNameChanged();
     }
 
+    SocketUtils::logDebug("Socket created successfully", filePath);
     Q_EMIT validChanged();
 
     return true;
 }
 
-static QString getSocketFile(int fd, bool doCheck) {
-    if (doCheck) {   // check socket file
+// Socket validation utilities
+namespace SocketValidation {
+    
+    // Validate that file descriptor is a socket
+    bool validateSocketDescriptor(int fd) {
         struct ::stat stat_buf{};
         if (fstat(fd, &stat_buf) != 0) {
-            qCWarning(waylibSocket) << "Failed to fstat file descriptor";
-            return {};
-        } else if (!S_ISSOCK(stat_buf.st_mode)) {
-            qCWarning(waylibSocket) << "File descriptor is not a socket";
-            return {};
+            SocketUtils::logWarning("Failed to fstat file descriptor");
+            return false;
         }
-
-        int accept_conn = 0;
-        socklen_t accept_conn_size = sizeof(accept_conn);
-        if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accept_conn,
-                       &accept_conn_size) != 0) {
-            qCWarning(waylibSocket) << "Failed to get socket options:" << QString::fromLocal8Bit(strerror(errno));
-            return {};
-        } else if (accept_conn == 0) {
-            qCWarning(waylibSocket) << "File descriptor is not in listening mode";
-            return {};
+        
+        if (!S_ISSOCK(stat_buf.st_mode)) {
+            SocketUtils::logWarning("File descriptor is not a socket");
+            return false;
         }
+        
+        return true;
     }
 
-    {   // get socket file path
+    // Check if socket is in listening mode
+    bool validateListeningSocket(int fd) {
+        int accept_conn = 0;
+        socklen_t accept_conn_size = sizeof(accept_conn);
+        
+        if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accept_conn, &accept_conn_size) != 0) {
+            SocketUtils::logSystemError("Failed to get socket options", QString::number(fd));
+            return false;
+        }
+        
+        if (accept_conn == 0) {
+            SocketUtils::logWarning("File descriptor is not in listening mode");
+            return false;
+        }
+        
+        return true;
+    }
+
+    // Extract socket path from file descriptor
+    QString extractSocketPath(int fd) {
         struct ::sockaddr_un addr;
         socklen_t len = sizeof(addr);
         memset(&addr, 0, sizeof(addr));
-        const int getpeernameStatus = ::getpeername(fd, (sockaddr *)&addr, &len);
+        
+        // Try getpeername first, fallback to getsockname
+        const int getpeernameStatus = ::getpeername(fd, reinterpret_cast<sockaddr*>(&addr), &len);
         if (getpeernameStatus != 0 || len == offsetof(sockaddr_un, sun_path)) {
-            // this is the case when we call it from QLocalServer, then there is no peername
             len = sizeof(addr);
-            if (::getsockname(fd, (sockaddr *)&addr, &len) != 0)
+            if (::getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
                 return {};
+            }
         }
 
-        if (len <= offsetof(::sockaddr_un, sun_path))
+        if (len <= offsetof(::sockaddr_un, sun_path)) {
             return {};
+        }
+        
         len -= offsetof(::sockaddr_un, sun_path);
+        return decodeSocketPath(addr.sun_path, len);
+    }
 
+    // Decode socket path from raw data, handling null termination properly
+    QString decodeSocketPath(const char* pathData, socklen_t pathLength) {
         QStringDecoder toUtf16(QStringDecoder::System, QStringDecoder::Flag::Stateless);
-        QByteArrayView textData(addr.sun_path, len);
+        QByteArrayView textData(pathData, pathLength);
         QString name = toUtf16(textData);
-        if (!name.isEmpty() && !toUtf16.hasError()) {
-            //conversion encodes the trailing zeros. So, in case of non-abstract namespace we
-            //chop them off as \0 character is not allowed in filenames
-            if ((name.at(name.size() - 1) == QChar::fromLatin1('\0'))) {
-                int truncPos = name.size() - 1;
-                while (truncPos > 0 && name.at(truncPos - 1) == QChar::fromLatin1('\0'))
-                    truncPos--;
-                name.truncate(truncPos);
-            }
+        
+        if (name.isEmpty() || toUtf16.hasError()) {
+            return {};
+        }
 
-            return name;
+        // Remove trailing null characters (not allowed in filenames for non-abstract namespace)
+        if (!name.isEmpty() && name.at(name.size() - 1) == QChar::fromLatin1('\0')) {
+            int truncPos = name.size() - 1;
+            while (truncPos > 0 && name.at(truncPos - 1) == QChar::fromLatin1('\0')) {
+                --truncPos;
+            }
+            name.truncate(truncPos);
+        }
+
+        return name;
+    }
+}
+
+static QString getSocketFile(int fd, bool doCheck) {
+    // Validate socket if requested
+    if (doCheck) {
+        if (!SocketValidation::validateSocketDescriptor(fd) || 
+            !SocketValidation::validateListeningSocket(fd)) {
+            return {};
         }
     }
 
-    return {};
+    // Extract and return socket path
+    return SocketValidation::extractSocketPath(fd);
 }
 
 bool WSocket::create(int fd, bool doListen)
 {
     W_D(WSocket);
 
-    if (isValid())
+    if (isValid()) {
+        SocketUtils::logWarning("Socket already valid, cannot create from file descriptor");
         return false;
+    }
 
-    QString socketFile = getSocketFile(fd, true);
-    if (socketFile.isEmpty())
+    const QString socketFile = getSocketFile(fd, true);
+    if (socketFile.isEmpty()) {
+        SocketUtils::logWarning("Failed to extract socket path from file descriptor");
         return false;
+    }
 
-    if (doListen && ::listen(d->fd, 128) < 0) {
-        qCWarning(waylibSocket) << "Failed to listen on socket:" << QString::fromLocal8Bit(strerror(errno));
+    if (doListen && !SocketCreation::enableSocketListening(fd, socketFile)) {
         return false;
     }
 
@@ -577,6 +802,9 @@ bool WSocket::create(int fd, bool doListen)
         d->socket_file = socketFile;
         Q_EMIT fullServerNameChanged();
     }
+
+    SocketUtils::logDebug("Socket created from file descriptor", socketFile);
+    Q_EMIT validChanged();
 
     return true;
 }
@@ -601,20 +829,34 @@ bool WSocket::isListening() const
     return d->eventSource;
 }
 
+// Socket event handling
 static int socket_data(int fd, uint32_t, void *data)
 {
-    WSocketPrivate *d = reinterpret_cast<WSocketPrivate*>(data);
-    sockaddr_un name;
-    socklen_t length;
-    int client_fd;
+    auto* socketPrivate = reinterpret_cast<WSocketPrivate*>(data);
+    if (!socketPrivate) {
+        SocketUtils::logWarning("Invalid socket private data in event callback");
+        return 0;
+    }
 
-    length = sizeof name;
-    client_fd = wl_os_accept_cloexec(fd, (sockaddr*)&name, &length);
-    if (client_fd < 0) {
-        qCWarning(waylibSocket) << "Failed to accept client connection:" << QString::fromLocal8Bit(strerror(errno));
+    sockaddr_un clientAddr{};
+    socklen_t addrLength = sizeof(clientAddr);
+    
+    const int clientFd = wl_os_accept_cloexec(fd, 
+                                             reinterpret_cast<sockaddr*>(&clientAddr), 
+                                             &addrLength);
+    if (clientFd < 0) {
+        SocketUtils::logSystemError("Failed to accept client connection", QString("socket fd: %1").arg(fd));
+        return 1; // Continue processing other events
+    }
+
+    SocketUtils::logDebug("Accepted new client connection", QString("client fd: %1").arg(clientFd));
+    
+    // Add client to socket
+    if (auto* socket = socketPrivate->q_func()) {
+        socket->addClient(clientFd);
     } else {
-        qCDebug(waylibSocket) << "Accepted new client connection with fd:" << client_fd;
-        d->q_func()->addClient(client_fd);
+        SocketUtils::logWarning("Socket instance not available during client connection");
+        ::close(clientFd);
     }
 
     return 1;
@@ -624,20 +866,37 @@ bool WSocket::listen(wl_display *display)
 {
     W_D(WSocket);
 
-    if (d->eventSource || !isValid())
+    if (d->eventSource) {
+        SocketUtils::logWarning("Socket is already listening");
         return false;
+    }
 
-    auto loop = wl_display_get_event_loop(display);
-    if (!loop)
+    if (!isValid()) {
+        SocketUtils::logWarning("Cannot listen on invalid socket");
         return false;
+    }
+
+    if (!display) {
+        SocketUtils::logWarning("Display parameter cannot be null");
+        return false;
+    }
+
+    auto* eventLoop = wl_display_get_event_loop(display);
+    if (!eventLoop) {
+        SocketUtils::logWarning("Failed to get event loop from display");
+        return false;
+    }
 
     d->display = display;
-    d->eventSource = wl_event_loop_add_fd(loop, d->fd,
-                                          WL_EVENT_READABLE,
-                                          socket_data, d);
-    if (!d->eventSource)
+    d->eventSource = wl_event_loop_add_fd(eventLoop, d->fd, WL_EVENT_READABLE, socket_data, d);
+    
+    if (!d->eventSource) {
+        SocketUtils::logWarning("Failed to add socket to event loop", d->socket_file);
+        d->display = nullptr;
         return false;
+    }
 
+    SocketUtils::logDebug("Socket listening started", d->socket_file);
     Q_EMIT listeningChanged();
 
     return true;
@@ -646,54 +905,88 @@ bool WSocket::listen(wl_display *display)
 WClient *WSocket::addClient(int fd)
 {
     W_D(WSocket);
-    auto client = wl_client_create(d->display, fd);
-    if (!client) {
-        qCWarning(waylibSocket) << "Failed to create Wayland client for fd:" << fd;
+    
+    if (!d->display) {
+        SocketUtils::logWarning("Cannot create client without valid display");
+        ::close(fd);
         return nullptr;
     }
 
-    qCDebug(waylibSocket) << "Created new Wayland client for fd:" << fd;
-    auto wclient = new WClient(client, this);
-    d->addClient(wclient);
+    auto* waylandClient = wl_client_create(d->display, fd);
+    if (!waylandClient) {
+        SocketUtils::logWarning("Failed to create Wayland client", QString("fd: %1").arg(fd));
+        ::close(fd);
+        return nullptr;
+    }
 
-    return wclient;
+    SocketUtils::logDebug("Created new Wayland client", QString("fd: %1").arg(fd));
+    auto* wClient = new WClient(waylandClient, this);
+    d->addClient(wClient);
+
+    return wClient;
 }
 
 WClient *WSocket::addClient(wl_client *client)
 {
-    W_D(WSocket);
-
-    WClient *wclient = nullptr;
-    if ((wclient = WClient::get(client))) {
-        if (wclient->socket() != this)
-            return nullptr;
-        if (d->clients.contains(wclient))
-            return wclient;
-    } else {
-        wclient = new WClient(client, this);
+    if (!client) {
+        SocketUtils::logWarning("Cannot add null client");
+        return nullptr;
     }
 
-    d->addClient(wclient);
-    return wclient;
+    W_D(WSocket);
+
+    WClient* existingClient = nullptr;
+    // Check if client already exists
+    if ((existingClient = WClient::get(client))) {
+        if (existingClient->socket() != this) {
+            SocketUtils::logWarning("Client belongs to different socket");
+            return nullptr;
+        }
+        
+        if (d->clients.contains(existingClient)) {
+            SocketUtils::logDebug("Client already exists in socket");
+            return existingClient;
+        }
+    }
+
+    // Create new WClient wrapper
+    auto* wClient = existingClient ? existingClient : new WClient(client, this);
+    d->addClient(wClient);
+    
+    return wClient;
 }
 
 bool WSocket::removeClient(wl_client *client)
 {
-    W_D(WSocket);
+    if (!client) {
+        SocketUtils::logWarning("Cannot remove null client");
+        return false;
+    }
 
-    if (auto c = WClient::get(client))
-        return removeClient(c);
+    if (auto* wClient = WClient::get(client)) {
+        return removeClient(wClient);
+    }
+    
+    SocketUtils::logWarning("Client not found in socket");
     return false;
 }
 
 bool WSocket::removeClient(WClient *client)
 {
+    if (!client) {
+        SocketUtils::logWarning("Cannot remove null WClient");
+        return false;
+    }
+
     W_D(WSocket);
 
-    bool ok = d->clients.removeOne(client);
-    if (!ok)
+    const bool removed = d->clients.removeOne(client);
+    if (!removed) {
+        SocketUtils::logWarning("Client not found in socket client list");
         return false;
+    }
 
+    SocketUtils::logDebug("Removing client from socket");
     Q_EMIT aboutToBeDestroyedClient(client);
     delete client;
     Q_EMIT clientsChanged();
