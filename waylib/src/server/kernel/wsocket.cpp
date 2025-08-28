@@ -31,12 +31,19 @@ Q_LOGGING_CATEGORY(waylibSocket, "waylib.server.socket", QtInfoMsg)
 
 #define LOCK_SUFFIX ".lock"
 
-// RAII wrapper for file descriptors
+/**
+ * @brief RAII wrapper for file descriptors with automatic cleanup
+ * 
+ * This class provides automatic management of file descriptors, ensuring
+ * they are properly closed when the object goes out of scope. It follows
+ * RAII principles and supports move semantics for efficient resource transfer.
+ */
 class FileDescriptor {
 public:
     explicit FileDescriptor(int fd = -1) noexcept : m_fd(fd) {}
     ~FileDescriptor() { reset(); }
 
+    // Non-copyable but movable
     FileDescriptor(const FileDescriptor&) = delete;
     FileDescriptor& operator=(const FileDescriptor&) = delete;
 
@@ -47,6 +54,7 @@ public:
     }
 
     int get() const noexcept { return m_fd; }
+    
     int release() noexcept {
         int fd = m_fd;
         m_fd = -1;
@@ -67,13 +75,20 @@ private:
     int m_fd;
 };
 
-// Helper functions for error handling and logging
+/**
+ * @brief Utility functions for consistent error handling and logging
+ * 
+ * These functions provide standardized logging patterns throughout the socket
+ * implementation, improving consistency and maintainability.
+ */
 namespace SocketUtils {
+    /// Log system errors with errno information
     inline void logSystemError(const QString& operation, const QString& context) {
         qCWarning(waylibSocket) << operation << "failed for" << context 
                                << ":" << QString::fromLocal8Bit(strerror(errno));
     }
 
+    /// Log warning messages with optional context
     inline void logWarning(const QString& message, const QString& context = QString()) {
         if (context.isEmpty()) {
             qCWarning(waylibSocket) << message;
@@ -82,6 +97,7 @@ namespace SocketUtils {
         }
     }
 
+    /// Log debug messages with optional context
     inline void logDebug(const QString& message, const QString& context = QString()) {
         if (context.isEmpty()) {
             qCDebug(waylibSocket) << message;
@@ -91,10 +107,15 @@ namespace SocketUtils {
     }
 }
 
-// Socket locking utilities
+/**
+ * @brief Socket locking utilities for Wayland socket management
+ * 
+ * These functions handle the creation and management of socket lock files
+ * to prevent multiple compositor instances from binding to the same socket.
+ */
 namespace SocketLocking {
     
-    // Create and open a lock file for the given socket path
+    /// Create and open a lock file for the given socket path
     FileDescriptor createLockFile(const QString& socketPath) {
         const QString lockFile = socketPath + LOCK_SUFFIX;
         const auto lockFilePath = lockFile.toUtf8();
@@ -110,7 +131,7 @@ namespace SocketLocking {
         return FileDescriptor(fd);
     }
 
-    // Acquire an exclusive lock on the file descriptor
+    /// Acquire an exclusive lock on the file descriptor
     bool acquireFileLock(int fd, const QString& lockFile) {
         if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
             SocketUtils::logWarning("Failed to lock - another compositor may be running", lockFile);
@@ -119,7 +140,7 @@ namespace SocketLocking {
         return true;
     }
 
-    // Check if socket file exists and clean it up if needed
+    /// Check if socket file exists and clean it up if needed
     bool validateAndCleanupSocket(const QString& socketPath) {
         struct stat socket_stat;
         const QByteArray socketPathBytes = socketPath.toUtf8();
@@ -143,7 +164,17 @@ namespace SocketLocking {
     }
 }
 
-// Copy from libwayland - refactored for better maintainability
+/**
+ * @brief Wayland socket locking implementation (adapted from libwayland)
+ * 
+ * This function creates a lock file for the given socket path to prevent
+ * multiple compositor instances from binding to the same socket. The lock
+ * is acquired exclusively and the existing socket file is cleaned up if
+ * it appears to be stale.
+ * 
+ * @param socketFile Path to the socket file to lock
+ * @return File descriptor for the lock file, or -1 on failure
+ */
 static int wl_socket_lock(const QString &socketFile)
 {
     // Create and open lock file
@@ -593,10 +624,15 @@ bool WSocket::autoCreate(const QString &directory)
     return false;
 }
 
-// Socket creation utilities
+/**
+ * @brief Socket creation and configuration utilities
+ * 
+ * These functions handle the creation, binding, and configuration of Unix
+ * domain sockets used for Wayland communication.
+ */
 namespace SocketCreation {
     
-    // Create and bind a Unix domain socket to the specified path
+    /// Create and bind a Unix domain socket to the specified path
     bool createAndBindSocket(int socketFd, const QString& filePath) {
         const QByteArray pathBytes = filePath.toUtf8();
         sockaddr_un addr{};
@@ -616,7 +652,7 @@ namespace SocketCreation {
         return true;
     }
 
-    // Set socket to listening mode
+    /// Set socket to listening mode with standard Wayland backlog size
     bool enableSocketListening(int socketFd, const QString& context) {
         constexpr int BACKLOG_SIZE = 128; // Standard backlog size for Wayland sockets
         
@@ -813,14 +849,25 @@ bool WSocket::bind(int fd)
 {
     W_D(WSocket);
 
-    if (isValid())
+    if (isValid()) {
+        SocketUtils::logWarning("Socket already valid, cannot bind to new file descriptor");
         return false;
+    }
 
     d->fd = fd;
     d->ownsFd = false;
     d->socket_file = getSocketFile(fd, false);
 
-    return false;
+    if (d->socket_file.isEmpty()) {
+        SocketUtils::logWarning("Failed to get socket path for bind operation");
+        d->fd = -1;
+        return false;
+    }
+
+    SocketUtils::logDebug("Socket bound to file descriptor", QString("fd: %1, path: %2").arg(fd).arg(d->socket_file));
+    Q_EMIT validChanged();
+
+    return true;
 }
 
 bool WSocket::isListening() const
